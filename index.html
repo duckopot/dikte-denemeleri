@@ -34,6 +34,7 @@
     <p id="last" class="muted warn" hidden></p>
   </section>
 
+  <div id="preview" class="preview" aria-live="polite"></div>
   <textarea id="out" placeholder="Konuştukça yazı burada belirir…" spellcheck="false"></textarea>
 
   <div class="row">
@@ -41,6 +42,7 @@
       <svg viewBox="0 0 24 24" width="44" height="44"><path fill="currentColor" d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2z"/></svg>
     </button>
   </div>
+  <label class="muted center live"><input type="checkbox" id="live" checked> Konuşurken geçici önizleme göster (son metin kayıt bitince tüm kayıttan çıkar)</label>
   <p id="micHint" class="muted center">Önce modeli yükle</p>
 
   <div class="row gap">

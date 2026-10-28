@@ -1,5 +1,7 @@
 # Dikte – tarayıcıda Whisper (model seçimli)
 
+**m5 (Türkçe kalite):** kayıt bitince TÜM kayıt tek geçişte çevrilir (30 sn'den uzunsa Whisper'ın kendi uzun-form penceresi: 30 sn pencere, 5 sn bindirme). Konuşurken görünen metin yalnızca gri/italik geçici önizlemedir (kutudan kapatılabilir) ve son metinle değiştirilir. Dosya yükleme de tek geçiş. Mikrofon ham alınır (echoCancellation/noiseSuppression/autoGain kapalı). Masaüstünde ONNX grafik optimizasyonu `all` (hızlı), iOS'ta `disabled`. `?hq=1`: WebGPU+f16'da fp16 encoder/decoder (1,6 GB, denenmedi).
+
 **Model seçimi (m4):** açılışta liste: `iPhone için (küçük)` = onnx-community/whisper-small (encoder q4 66 MB + decoder int8 157 MB = 223 MB, WASM) ve `Turbo (büyük, bilgisayar için)` = whisper-large-v3-turbo (aşağıda). iOS'ta küçük, diğerlerinde turbo önerilir; seçim `localStorage['dikte.model']`'de tutulur, `?model=small|turbo` ile zorlanır. Her modelin önbelleği ayrı (anahtarlar model deposunun URL'si), "Seçili modeli sil" / "Hepsini sil" bağlantıları var.
 
 

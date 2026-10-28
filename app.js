@@ -1,7 +1,7 @@
 const $ = (id) => document.getElementById(id);
 const out = $('out'), mic = $('mic'), loadBtn = $('loadBtn'), fileIn = $('file');
 const SR = 16000;
-let ready = false, recording = false, pending = 0, nextId = 1;
+let ready = false, recording = false, finalizing = false, previewText = '', pending = 0, nextId = 1;
 const waiters = new Map();
 
 // ---- Service worker (offline shell + cross-origin isolation for WASM threads) ----
@@ -37,10 +37,14 @@ worker.onmessage = (e) => {
     mic.disabled = false; fileIn.disabled = false; $('micHint').textContent = 'Konuşmak için dokun';
     window.__ready = m;
   } else if (m.type === 'result') {
-    pending--; appendText(m.text); $('status').textContent = pending ? 'Yazılıyor…' : '';
+    pending--;
+    if (m.final) { $('preview').textContent = ''; previewText = ''; appendText(m.text); $('status').textContent = pending ? 'Yazılıyor…' : ''; mic.disabled = false; }
+    else if (!m.skipped && recording) { previewText += (previewText ? ' ' : '') + m.text; $('preview').textContent = previewText; }
+    else if (!recording && !m.skipped && !finalizing) { /* late preview after stop: ignore */ }
+    if (!m.final) $('status').textContent = recording ? 'Dinliyorum…' : $('status').textContent;
     (waiters.get(m.id) || (() => {}))(m); window.__last = m;
   } else if (m.type === 'error') {
-    pending = Math.max(0, pending - 1);
+    pending = Math.max(0, pending - 1); mic.disabled = !ready;
     $('status').textContent = 'Hata: ' + m.text; loadBtn.disabled = false; sel.disabled = false;
     if (waiters.has(m.id)) waiters.get(m.id)({ error: m.text });
     window.__err = m.text;
@@ -51,10 +55,10 @@ function appendText(t) {
   out.value += (out.value && !/\s$/.test(out.value) ? ' ' : '') + t;
   out.scrollTop = out.scrollHeight;
 }
-function send(audio) {
+function send(audio, final) {
   const id = nextId++; pending++;
-  $('status').textContent = 'Yazılıyor…';
-  worker.postMessage({ type: 'transcribe', id, audio, language: $('lang').value }, [audio.buffer]);
+  if (final) $('status').textContent = 'Tüm kayıt çevriliyor… (uzun kayıtlar biraz sürebilir)';
+  worker.postMessage({ type: 'transcribe', id, audio, final: !!final, language: $('lang').value }, [audio.buffer]);
   return new Promise((res) => waiters.set(id, res));
 }
 
@@ -83,7 +87,7 @@ loadBtn.onclick = () => {
   worker.postMessage({ type: 'load', model: chosen, force: new URLSearchParams(location.search).get('device') });
 };
 // ---- Crash-resilient diagnostics: the last stage is written to localStorage on every change ----
-const BUILD = '2026-10-28-m4';
+const BUILD = '2026-10-28-m5';
 const TRACE_KEY = 'dikte.trace';
 let lastTrace = null, lastWrite = 0;
 const readTrace = () => { try { return JSON.parse(localStorage.getItem(TRACE_KEY) || 'null'); } catch (e) { return null; } };
@@ -143,46 +147,57 @@ function takeBuffer() {
   for (const b of buf) { all.set(b, o); o += b.length; }
   buf = []; bufLen = 0; return resample(all, rate);
 }
-function flush(final) {
+// Live preview only: short chunks, shown grey/italic, thrown away when the full-recording pass finishes.
+function flush() {
   if (!bufLen) return;
   const a = takeBuffer();
   if (a.length < SR * 0.5 || rms(a) < 0.005) return;      // skip silence (avoids hallucinations)
-  send(a);
+  send(a, false);
 }
 function tick() {
   const secs = bufLen / rate;
-  const tailN = Math.floor(rate * 0.5), last = buf[buf.length - 1];
-  // cut when we have >=3.5 s and the speaker just paused, or force-cut at 9 s
+  const last = buf[buf.length - 1];
   let paused = false;
   if (last) paused = rms(last.length > 2048 ? last.subarray(last.length - 2048) : last) < 0.008;
   quietRun = paused ? quietRun + 1 : 0;
   if ((secs >= 3.5 && quietRun >= 2) || secs >= 9) { quietRun = 0; flush(); }
 }
+let full = [], fullLen = 0;
 async function startRec() {
-  stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  // raw microphone: browser echo-cancel / noise-suppress / auto-gain distort speech and hurt recognition
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
   ctx = new (window.AudioContext || window.webkitAudioContext)();
   await ctx.resume(); rate = ctx.sampleRate;
   await ctx.audioWorklet.addModule('audio-worklet.js');
   const src = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, 'cap');
-  node.port.onmessage = (e) => { buf.push(e.data); bufLen += e.data.length; };
+  full = []; fullLen = 0; buf = []; bufLen = 0; previewText = ''; $('preview').textContent = '';
+  node.port.onmessage = (e) => { full.push(e.data); fullLen += e.data.length; if ($('live').checked) { buf.push(e.data); bufLen += e.data.length; } };
   src.connect(node);
   const mute = ctx.createGain(); mute.gain.value = 0; node.connect(mute).connect(ctx.destination);
   timer = setInterval(tick, 250);
-  recording = true; mic.classList.add('rec'); $('micHint').textContent = 'Dinliyorum… durdurmak için dokun';
+  recording = true; mic.classList.add('rec'); $('micHint').textContent = 'Dinliyorum… bitirince dokun, tüm kayıt tek seferde çevrilir';
 }
 async function stopRec() {
   recording = false; clearInterval(timer); mic.classList.remove('rec');
-  flush(true);
+  worker.postMessage({ type: 'cancel-preview', upto: nextId - 1 });        // drop queued preview chunks
   try { node.disconnect(); } catch (e) {}
   stream.getTracks().forEach(t => t.stop());
   await ctx.close();
+  const all = new Float32Array(fullLen); let o = 0;
+  for (const b of full) { all.set(b, o); o += b.length; }
+  full = []; fullLen = 0; buf = []; bufLen = 0;
+  const a16 = resample(all, rate);
   $('micHint').textContent = 'Konuşmak için dokun';
+  if (a16.length < SR * 0.4 || rms(a16) < 0.002) { $('preview').textContent = ''; previewText = ''; $('status').textContent = 'Ses algılanmadı.'; return; }
+  finalizing = true; mic.disabled = true;
+  $('preview').textContent = previewText ? previewText + ' …' : '';
+  send(a16, true);                                                            // ONE pass over the whole recording (long-form: 30 s windows, 5 s stride)
 }
 mic.onclick = async () => {
   if (!ready) return;
   try { recording ? await stopRec() : await startRec(); }
-  catch (e) { $('status').textContent = 'Mikrofon hatası: ' + (e.message || e); }
+  catch (e) { $('status').textContent = 'Mikrofon hatası: ' + (e.message || e); mic.disabled = false; }
 };
 
 // ---- File upload ----
@@ -197,14 +212,9 @@ async function decodeFile(file) {
 }
 async function transcribeFile(file) {
   $('status').textContent = 'Dosya çözülüyor…';
-  const a = await decodeFile(file), step = SR * 28;
-  for (let i = 0; i < a.length; i += step) {
-    const part = a.slice(i, Math.min(a.length, i + step));
-    if (rms(part) < 0.003) continue;
-    $('status').textContent = 'Yazılıyor… %' + Math.round(i / a.length * 100);
-    await send(part);
-  }
-  $('status').textContent = '';
+  const a = await decodeFile(file);
+  if (rms(a) < 0.001) { $('status').textContent = 'Ses algılanmadı.'; return; }
+  await send(a, true);                       // whole file in one pass (long-form handled inside the worker)
 }
 fileIn.onchange = async () => { const f = fileIn.files[0]; if (f) { try { await transcribeFile(f); } catch (e) { $('status').textContent = 'Dosya hatası: ' + (e.message || e); } fileIn.value = ''; } };
 window.__transcribeFile = transcribeFile;   // for automated tests

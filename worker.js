@@ -3,7 +3,7 @@
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
 import { pipeline, env } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m4';
+const BUILD = '2026-10-28-m5';
 const Q = new URL(self.location.href).searchParams;
 const CHUNK = 8 * 1048576;
 const CHUNK_CACHE = 'model-chunks-v1', SMALL_CACHE = 'model-small-v1', LEGACY_CACHE = 'transformers-cache';
@@ -186,6 +186,7 @@ async function pickConfig(force) {
   else if (g)      cfg = { device: 'webgpu', enc: 'q4',    dec: 'q4',    label: 'WebGPU · q4' };
   else             cfg = { device: 'wasm',   enc: 'q4',    dec: 'q4',    label: 'WASM · q4' };
   if (force === 'webgpu' && !g) throw new Error('Bu cihazda WebGPU yok.');
+  if (Q.get('hq') && g && g.f16) { cfg.enc = 'fp16'; cfg.dec = 'fp16'; cfg.label = 'WebGPU · fp16'; }   // ?hq=1: best quality on a desktop GPU (1.6 GB, untested on box: no GPU)
   if (Q.get('enc')) cfg.enc = Q.get('enc');
   if (Q.get('dec')) cfg.dec = Q.get('dec');
   if (Q.get('decdev') && cfg.device === 'webgpu') {                   // split: encoder on GPU, decoder on CPU (WASM)
@@ -203,7 +204,7 @@ function sessionOptions(cfg) {
   const xs = Q.get('xs');                                                // experiment: ORT session config keys, e.g. xs=disable_prepacking
   if (xs) { o.extra = { session: {} }; for (const k of xs.split(',')) o.extra.session[k] = '1'; }
   // 'disabled' = biggest single memory saver measured (-35% peak: ORT's graph optimizer makes extra copies of all weights); ~30% slower on CPU
-  o.graphOptimizationLevel = Q.get('opt') || 'disabled';                  // override: ?opt=basic|extended|all
+  o.graphOptimizationLevel = Q.get('opt') || (iOS ? 'disabled' : 'all');   // desktop: full optimization (faster); iPhone: memory first                  // override: ?opt=basic|extended|all
   return o;
 }
 function setThreads(cfg) {
@@ -222,7 +223,7 @@ async function load(force) {
   trace('başlıyor', { build: BUILD, ios: iOS, model: KEY });
   let cfg = await pickConfig(force || Q.get('device'));
   T = { device: cfg.device + (cfg.decdev ? '+' + cfg.decdev : ''), dtype: cfg.enc + '/' + cfg.dec };
-  trace('yapılandırma', { gpu: cfg.gpu, mb: cfg.mb, opt: Q.get('opt') || 'disabled' });
+  trace('yapılandırma', { gpu: cfg.gpu, mb: cfg.mb, opt: Q.get('opt') || (iOS ? 'disabled' : 'all') });
 
   // 1) download (streams to Cache Storage; low memory, resumable)
   const prog = (() => {
@@ -267,13 +268,17 @@ async function load(force) {
   post({ type: 'ready', ...info });
 }
 
-let chain = Promise.resolve(), firstRun = true;
+let chain = Promise.resolve(), firstRun = true, previewCutoff = 0;
 async function transcribe(m) {
+  if (!m.final && m.id <= previewCutoff) { post({ type: 'result', id: m.id, text: '', skipped: true }); return; }   // recording already stopped
   const t0 = performance.now();
   if (firstRun) trace('ilk-çevirme-başladı');
-  const out = await asr(m.audio, { language: m.language, task: 'transcribe', return_timestamps: false, max_new_tokens: 220 });
+  const opts = { language: m.language, task: 'transcribe', return_timestamps: false };
+  // final pass: the whole recording in one go. Longer than 30 s -> Whisper's own long-form windows (30 s, 5 s stride).
+  const out = m.final ? await asr(m.audio, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 })
+                      : await asr(m.audio, { ...opts, max_new_tokens: 220 });
   if (firstRun) { firstRun = false; trace('ilk-çevirme-bitti', { ms: Math.round(performance.now() - t0) }); }
-  post({ type: 'result', id: m.id, text: (out.text || '').trim(), ms: Math.round(performance.now() - t0), dur: m.audio.length / 16000 });
+  post({ type: 'result', id: m.id, final: !!m.final, text: (out.text || '').trim(), ms: Math.round(performance.now() - t0), dur: m.audio.length / 16000 });
 }
 
 self.onmessage = (e) => {
@@ -281,6 +286,7 @@ self.onmessage = (e) => {
   const fail = (err, id) => { const t = String((err && err.message) || err); trace('hata', { err: t }); post({ type: 'error', text: t, id }); };
   if (m.model) setModel(m.model);
   if (m.type === 'load') load(m.force).catch((err) => fail(err));
+  else if (m.type === 'cancel-preview') previewCutoff = Math.max(previewCutoff, m.upto);
   else if (m.type === 'transcribe') chain = chain.then(() => transcribe(m)).catch((err) => fail(err, m.id));
   else if (m.type === 'probe') (async () => {       // is the model already fully stored? (for auto-load)
     try {
