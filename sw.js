@@ -1,4 +1,4 @@
-const V='dikte-v6';
+const V='dikte-v7';
 const SHELL=['./','index.html','app.js','worker.js','style.css','audio-worklet.js','icon.svg','manifest.webmanifest',
  'vendor/transformers.min.js','vendor/ort-wasm-simd-threaded.jsep.mjs','vendor/ort-wasm-simd-threaded.jsep.wasm'];
 // NOTE: model files live in Cache Storage caches "model-chunks-v1"/"model-small-v1" (written by worker.js) – never touched here,

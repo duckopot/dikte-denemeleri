@@ -3,7 +3,7 @@
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
 import { pipeline, env } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m6';
+const BUILD = '2026-10-28-m7';
 const Q = new URL(self.location.href).searchParams;
 const CHUNK = 8 * 1048576;
 const CHUNK_CACHE = 'model-chunks-v1', SMALL_CACHE = 'model-small-v1', LEGACY_CACHE = 'transformers-cache';
@@ -268,18 +268,34 @@ async function load(force) {
   post({ type: 'ready', ...info });
 }
 
+// Whisper sometimes loops ("merde merde merde ..."): collapse any word or phrase (1-6 words) repeated more than twice in a row.
+function dedupe(t) {
+  let w = t.split(/\s+/).filter(Boolean);
+  for (let n = 1; n <= 6; n++) {
+    const out = [];
+    for (let i = 0; i < w.length;) {
+      const g = w.slice(i, i + n).join(' ').toLowerCase().replace(/[.,!?;:]/g, '');
+      let k = 1;
+      while (i + (k + 1) * n <= w.length && w.slice(i + k * n, i + (k + 1) * n).join(' ').toLowerCase().replace(/[.,!?;:]/g, '') === g) k++;
+      const keep = k > 2 ? 1 : k;
+      out.push(...w.slice(i, i + keep * n)); i += k * n;
+    }
+    w = out;
+  }
+  return w.join(' ');
+}
 let chain = Promise.resolve(), firstRun = true, previewCutoff = 0;
 async function transcribe(m) {
   if (!m.final && m.id <= previewCutoff) { post({ type: 'result', id: m.id, text: '', skipped: true }); return; }   // recording already stopped
   const t0 = performance.now();
   if (firstRun) trace('ilk-çevirme-başladı');
-  const opts = { task: 'transcribe', return_timestamps: false };
+  const opts = { task: 'transcribe', return_timestamps: false, no_repeat_ngram_size: 4 };
   if (m.language && m.language !== 'auto') opts.language = m.language;
   // final pass: the whole recording in one go. Longer than 30 s -> Whisper's own long-form windows (30 s, 5 s stride).
   const out = m.final ? await asr(m.audio, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 })
                       : await asr(m.audio, { ...opts, max_new_tokens: 220 });
   if (firstRun) { firstRun = false; trace('ilk-çevirme-bitti', { ms: Math.round(performance.now() - t0) }); }
-  post({ type: 'result', id: m.id, final: !!m.final, text: (out.text || '').trim(), ms: Math.round(performance.now() - t0), dur: m.audio.length / 16000 });
+  post({ type: 'result', id: m.id, final: !!m.final, text: dedupe((out.text || '').trim()), ms: Math.round(performance.now() - t0), dur: m.audio.length / 16000 });
 }
 
 self.onmessage = (e) => {
