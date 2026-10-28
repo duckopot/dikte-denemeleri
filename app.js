@@ -62,17 +62,50 @@ loadBtn.onclick = () => {
   loadBtn.disabled = true; $('status').textContent = 'Model indiriliyor…'; $('progWrap').hidden = false;
   worker.postMessage({ type: 'load', force: new URLSearchParams(location.search).get('device') });
 };
-// If the model is already cached, load automatically (works offline).
-(async () => {
-  try {
-    if (await caches.has('transformers-cache')) {
-      const c = await caches.open('transformers-cache');
-      const keys = await c.keys();
-      if (keys.some(r => r.url.includes('decoder_model_merged'))) loadBtn.click();
-    }
-  } catch (e) {}
-})();
+// ---- Crash-resilient diagnostics: the last stage is written to localStorage on every change ----
+const BUILD = '2026-10-28-m2';
+const TRACE_KEY = 'dikte.trace';
+let lastTrace = null, lastWrite = 0;
+const readTrace = () => { try { return JSON.parse(localStorage.getItem(TRACE_KEY) || 'null'); } catch (e) { return null; } };
+function writeTrace(t, force) {
+  const now = Date.now(); lastTrace = { ...t, t: now };
+  if (!force && now - lastWrite < 700) return;
+  lastWrite = now;
+  try { localStorage.setItem(TRACE_KEY, JSON.stringify(lastTrace)); } catch (e) {}
+}
+const prev = readTrace();
+const crashed = !!(prev && prev.state === 'running');
+if (crashed) {
+  const where = [prev.stage, prev.file, prev.device && (prev.device + ' ' + prev.dtype), prev.loaded != null ? Math.round(prev.loaded / 1048576) + ' MB' : '', prev.err].filter(Boolean).join(' · ');
+  $('last').textContent = 'Son deneme şu aşamada kesildi: ' + where + ' (' + new Date(prev.t).toLocaleTimeString('tr-TR') + '). Bu bilgi sorunu bulmak için kaydedildi.';
+  $('last').hidden = false;
+} else if (prev && prev.state === 'error') {
+  $('last').textContent = 'Son deneme hata verdi: ' + (prev.err || prev.stage); $('last').hidden = false;
+}
+writeTrace({ state: 'idle', stage: 'sayfa açıldı' }, true);
+addEventListener('pagehide', (e) => { if (!e.persisted && lastTrace && lastTrace.state === 'running') writeTrace({ ...lastTrace, state: 'closed' }, true); });
+addEventListener('error', (e) => { $('status').textContent = 'Hata: ' + (e.message || e); writeTrace({ ...(lastTrace || {}), state: 'error', stage: 'sayfa-hatası', err: String(e.message || e) }, true); });
+addEventListener('unhandledrejection', (e) => { const t = String((e.reason && e.reason.message) || e.reason); $('status').textContent = 'Hata: ' + t; writeTrace({ ...(lastTrace || {}), state: 'error', stage: 'sayfa-reddi', err: t }, true); });
+let lastLoaded = 0;
+worker.addEventListener('message', (e) => {
+  const m = e.data;
+  if (m.type === 'trace') {
+    const { type, ...rest } = m;
+    const st = (rest.stage === 'hazır' || rest.stage === 'ilk-çevirme-bitti') ? 'ready' : /hata|error|rejection/.test(rest.stage) ? 'error' : 'running';
+    writeTrace({ ...rest, state: st, loaded: lastLoaded }, true);
+  } else if (m.type === 'progress') { lastLoaded = m.loaded; if (lastTrace && lastTrace.state === 'running') writeTrace({ ...lastTrace, stage: lastTrace.stage, loaded: m.loaded, file: (m.file || '').replace('onnx/', '') }, false); }
+  else if (m.type === 'error' && lastTrace && lastTrace.state !== 'error') writeTrace({ ...lastTrace, state: 'error', err: m.text }, true);
+  else if (m.type === 'wiped') { $('status').textContent = 'İndirilen model silindi.'; $('modelInfo').textContent = 'Model silindi. Yeniden indirmek için düğmeye bas.'; loadBtn.hidden = false; loadBtn.disabled = false; }
+  else if (m.type === 'cached') {
+    if (m.ok && !crashed) loadBtn.click();                            // already stored and last run did not die: load by itself (works offline)
+    else if (m.have > 0 && !m.ok) loadBtn.textContent = 'İndirmeye devam et (' + Math.round(100 * m.have / m.all) + '% hazır)';
+    else if (m.ok && crashed) loadBtn.textContent = 'Modeli belleğe yükle (indirilmiş)';
+  }
+});
+worker.postMessage({ type: 'probe', force: new URLSearchParams(location.search).get('device') });
 if (new URLSearchParams(location.search).get('auto')) loadBtn.click();
+$('wipe').onclick = () => { if (confirm('İndirilen model silinsin mi?')) worker.postMessage({ type: 'wipe' }); };
+$('envInfo').textContent += ' · sürüm ' + BUILD;
 
 // ---- Live dictation ----
 let ctx, stream, node, buf = [], bufLen = 0, timer, quietRun = 0, rate;

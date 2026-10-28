@@ -29,6 +29,7 @@
       <div id="progText">0%</div>
     </div>
     <p id="status" class="muted"></p>
+    <p id="last" class="muted warn" hidden></p>
   </section>
 
   <textarea id="out" placeholder="Konuştukça yazı burada belirir…" spellcheck="false"></textarea>
@@ -47,6 +48,7 @@
     <button id="copy" class="secondary">Kopyala</button>
     <button id="clear" class="secondary">Temizle</button>
   </div>
+  <p class="center"><a href="#" id="wipeLink" class="muted" onclick="document.getElementById('wipe').click();return false">İndirilen modeli sil</a><button id="wipe" hidden></button></p>
 
   <footer class="muted center">
     Sunucu yok, takip yok. Model ilk açılışta huggingface.co'dan bir kez iner, sonra çevrimdışı çalışır.

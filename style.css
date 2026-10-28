@@ -22,3 +22,6 @@ textarea{width:100%;min-height:200px;background:#161922;border:1px solid #2a2f3b
 @keyframes pulse{0%{box-shadow:0 0 0 0 #ef444488}100%{box-shadow:0 0 0 24px #ef444400}}
 .muted{color:#8a90a0;font-size:13px}
 .center{text-align:center;margin:0}
+
+.warn{color:#f5b942;line-height:1.4;margin:8px 0 0}
+#wipeLink{font-size:12px}
