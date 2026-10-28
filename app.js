@@ -87,7 +87,7 @@ loadBtn.onclick = () => {
   worker.postMessage({ type: 'load', model: chosen, force: new URLSearchParams(location.search).get('device') });
 };
 // ---- Crash-resilient diagnostics: the last stage is written to localStorage on every change ----
-const BUILD = '2026-10-28-m8';
+const BUILD = '2026-10-28-m9';
 const TRACE_KEY = 'dikte.trace';
 let lastTrace = null, lastWrite = 0;
 const readTrace = () => { try { return JSON.parse(localStorage.getItem(TRACE_KEY) || 'null'); } catch (e) { return null; } };

@@ -1,9 +1,9 @@
 // Dikte worker – Whisper on-device (transformers.js 3.8.1 + onnxruntime-web).
 // Memory strategy (see README): model files are downloaded in 8 MB Range chunks straight into Cache Storage
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
-import { pipeline, env } from './vendor/transformers.min.js';
+import { pipeline, env, Tensor } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m8';
+const BUILD = '2026-10-28-m9';
 const Q = new URL(self.location.href).searchParams;
 const CHUNK = 8 * 1048576;
 const CHUNK_CACHE = 'model-chunks-v1', SMALL_CACHE = 'model-small-v1', LEGACY_CACHE = 'transformers-cache';
@@ -287,21 +287,44 @@ function dedupe(t) {
 // Auto language: Whisper picks one language per pass, so split the recording only at pauses (never mid-word)
 // and let each sentence-sized piece get its own language.
 function splitAtPauses(a) {
-  const F = 480, n = Math.floor(a.length / F); if (n < 10) return [a];
+  const F = 160, n = Math.floor(a.length / F); if (n < 300) return [a];          // 10 ms frames; under 3 s: one piece
   const rms = new Float32Array(n);
   for (let i = 0; i < n; i++) { let e = 0; for (let j = i * F; j < (i + 1) * F; j++) e += a[j] * a[j]; rms[i] = Math.sqrt(e / F); }
-  const sorted = Array.from(rms).sort((x, y) => x - y), floor = sorted[Math.floor(n * 0.05)], loud = sorted[Math.floor(n * 0.9)];
-  const thr = Math.min(Math.max(floor * 3, floor + 0.004), loud * 0.15);
-  const cuts = []; let run = 0;
-  for (let i = 0; i < n; i++) {
-    if (rms[i] < thr) run++;
-    else { if (run >= 15) cuts.push(i - Math.floor(run / 2)); run = 0; }   // pause of 0.45 s or more -> cut in its middle
-  }
-  const segs = []; let start = 0;
-  for (const c of cuts) { const pos = c * F; if (pos - start >= 16000 * 1.5) { segs.push(a.subarray(start, pos)); start = pos; } }
-  if (a.length - start < 16000 * 1.5 && segs.length) { const last = segs.pop(); segs.push(a.subarray(last.byteOffset / 4, a.length)); }
-  else segs.push(a.subarray(start));
+  const W = 15, sm = new Float32Array(n);                                         // 150 ms smoothed energy
+  for (let i = 0; i < n; i++) { let e = 0, c = 0; for (let k = Math.max(0, i - 7); k < Math.min(n, i + 8); k++) { e += rms[k]; c++; } sm[i] = e / c; }
+  // recursively cut any piece longer than 7 s at its quietest point (a word gap), keeping pieces >= 1.5 s
+  const cuts = [];
+  const rec = (s0, s1) => {
+    if (s1 - s0 <= 700) return;   // pieces of about 3.5-7 s
+    let best = -1, bv = Infinity;
+    for (let i = s0 + 150; i < s1 - 150; i++) if (sm[i] < bv) { bv = sm[i]; best = i; }
+    if (best < 0) return;
+    rec(s0, best); cuts.push(best); rec(best, s1);
+  };
+  rec(0, n);
+  cuts.sort((x, y) => x - y);
+  const segs = []; let st = 0;
+  for (const c of cuts) { segs.push(a.subarray(st, c * F)); st = c * F; }
+  segs.push(a.subarray(st));
   return segs;
+}
+// returns { lang, p } from the model's language-token probabilities (the library itself never detects)
+async function detectLang(seg) {
+  try {
+    const gc = asr.model.generation_config, inp = await asr.processor(seg);
+    const dec = new Tensor('int64', BigInt64Array.from([BigInt(gc.decoder_start_token_id)]), [1, 1]);
+    const o = await asr.model({ ...inp, decoder_input_ids: dec });
+    const L = o.logits, V = L.dims.at(-1), last = L.data.subarray ? L.data.subarray(L.data.length - V) : Array.from(L.data).slice(-V);
+    const langs = Object.entries(gc.lang_to_id);
+    let mx = -Infinity; for (const [, id] of langs) mx = Math.max(mx, Number(last[Number(id)]));
+    let z = 0; const pr = langs.map(([k, id]) => { const e = Math.exp(Number(last[Number(id)]) - mx); z += e; return [k.slice(2, -2), e]; });
+    pr.forEach((x) => (x[1] /= z)); pr.sort((x, y) => y[1] - x[1]);
+    const P = Object.fromEntries(pr);
+    // user speaks mostly Turkish/English: an unsure guess of another language falls back to the likelier of the two
+    let lang = pr[0][0];
+    if (lang !== 'tr' && lang !== 'en' && pr[0][1] < 0.6) lang = (P.tr || 0) >= (P.en || 0) ? 'tr' : 'en';
+    return { lang, p: P[lang], top: pr.slice(0, 3).map(([k, v]) => k + ':' + v.toFixed(2)).join(' ') + ' tr:' + (P.tr || 0).toFixed(2) + ' =>' + lang };
+  } catch (e) { trace('dil-algilama-hatasi', { err: String(e && e.message || e) }); return null; }
 }
 let chain = Promise.resolve(), firstRun = true, previewCutoff = 0;
 async function transcribe(m) {
@@ -313,9 +336,20 @@ async function transcribe(m) {
   // final pass: the whole recording in one go. Longer than 30 s -> Whisper's own long-form windows (30 s, 5 s stride).
   let out;
   if (m.final && !opts.language) {
-    const parts = [];
+    // the library silently assumes English when no language is given, so detect it ourselves per ~5 s piece,
+    // then glue neighbouring pieces of the same language back together and transcribe each run in one go
+    const groups = [];
     for (const seg of splitAtPauses(m.audio)) {
-      const r = await asr(seg, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 });
+      const d = await detectLang(seg), lang = d ? d.lang : 'tr';
+      const g = groups[groups.length - 1];
+      if (g && g.lang === lang) g.segs.push(seg); else groups.push({ lang, segs: [seg] });
+    }
+    trace('dil-gruplari', { g: groups.map((g) => g.lang + ':' + g.segs.reduce((x, y) => x + y.length, 0) / 16000) });
+    const parts = [];
+    for (const g of groups) {
+      const len = g.segs.reduce((x, y) => x + y.length, 0), buf = new Float32Array(len);
+      let o = 0; for (const sg of g.segs) { buf.set(sg, o); o += sg.length; }
+      const r = await asr(buf, { ...opts, language: g.lang, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 });
       const t = (r.text || '').trim(); if (t) parts.push(dedupe(t));
     }
     out = { text: parts.join(' ') };
