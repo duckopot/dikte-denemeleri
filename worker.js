@@ -3,7 +3,7 @@
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
 import { pipeline, env } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m7';
+const BUILD = '2026-10-28-m8';
 const Q = new URL(self.location.href).searchParams;
 const CHUNK = 8 * 1048576;
 const CHUNK_CACHE = 'model-chunks-v1', SMALL_CACHE = 'model-small-v1', LEGACY_CACHE = 'transformers-cache';
@@ -284,6 +284,25 @@ function dedupe(t) {
   }
   return w.join(' ');
 }
+// Auto language: Whisper picks one language per pass, so split the recording only at pauses (never mid-word)
+// and let each sentence-sized piece get its own language.
+function splitAtPauses(a) {
+  const F = 480, n = Math.floor(a.length / F); if (n < 10) return [a];
+  const rms = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let e = 0; for (let j = i * F; j < (i + 1) * F; j++) e += a[j] * a[j]; rms[i] = Math.sqrt(e / F); }
+  const sorted = Array.from(rms).sort((x, y) => x - y), floor = sorted[Math.floor(n * 0.05)], loud = sorted[Math.floor(n * 0.9)];
+  const thr = Math.min(Math.max(floor * 3, floor + 0.004), loud * 0.15);
+  const cuts = []; let run = 0;
+  for (let i = 0; i < n; i++) {
+    if (rms[i] < thr) run++;
+    else { if (run >= 15) cuts.push(i - Math.floor(run / 2)); run = 0; }   // pause of 0.45 s or more -> cut in its middle
+  }
+  const segs = []; let start = 0;
+  for (const c of cuts) { const pos = c * F; if (pos - start >= 16000 * 1.5) { segs.push(a.subarray(start, pos)); start = pos; } }
+  if (a.length - start < 16000 * 1.5 && segs.length) { const last = segs.pop(); segs.push(a.subarray(last.byteOffset / 4, a.length)); }
+  else segs.push(a.subarray(start));
+  return segs;
+}
 let chain = Promise.resolve(), firstRun = true, previewCutoff = 0;
 async function transcribe(m) {
   if (!m.final && m.id <= previewCutoff) { post({ type: 'result', id: m.id, text: '', skipped: true }); return; }   // recording already stopped
@@ -292,8 +311,16 @@ async function transcribe(m) {
   const opts = { task: 'transcribe', return_timestamps: false, no_repeat_ngram_size: 4 };
   if (m.language && m.language !== 'auto') opts.language = m.language;
   // final pass: the whole recording in one go. Longer than 30 s -> Whisper's own long-form windows (30 s, 5 s stride).
-  const out = m.final ? await asr(m.audio, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 })
-                      : await asr(m.audio, { ...opts, max_new_tokens: 220 });
+  let out;
+  if (m.final && !opts.language) {
+    const parts = [];
+    for (const seg of splitAtPauses(m.audio)) {
+      const r = await asr(seg, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 });
+      const t = (r.text || '').trim(); if (t) parts.push(dedupe(t));
+    }
+    out = { text: parts.join(' ') };
+  } else out = m.final ? await asr(m.audio, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 })
+                       : await asr(m.audio, { ...opts, max_new_tokens: 220 });
   if (firstRun) { firstRun = false; trace('ilk-çevirme-bitti', { ms: Math.round(performance.now() - t0) }); }
   post({ type: 'result', id: m.id, final: !!m.final, text: dedupe((out.text || '').trim()), ms: Math.round(performance.now() - t0), dur: m.audio.length / 16000 });
 }
