@@ -3,7 +3,7 @@
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
 import { pipeline, env } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m5';
+const BUILD = '2026-10-28-m6';
 const Q = new URL(self.location.href).searchParams;
 const CHUNK = 8 * 1048576;
 const CHUNK_CACHE = 'model-chunks-v1', SMALL_CACHE = 'model-small-v1', LEGACY_CACHE = 'transformers-cache';
@@ -273,7 +273,8 @@ async function transcribe(m) {
   if (!m.final && m.id <= previewCutoff) { post({ type: 'result', id: m.id, text: '', skipped: true }); return; }   // recording already stopped
   const t0 = performance.now();
   if (firstRun) trace('ilk-çevirme-başladı');
-  const opts = { language: m.language, task: 'transcribe', return_timestamps: false };
+  const opts = { task: 'transcribe', return_timestamps: false };
+  if (m.language && m.language !== 'auto') opts.language = m.language;
   // final pass: the whole recording in one go. Longer than 30 s -> Whisper's own long-form windows (30 s, 5 s stride).
   const out = m.final ? await asr(m.audio, { ...opts, chunk_length_s: 30, stride_length_s: 5, max_new_tokens: 300 })
                       : await asr(m.audio, { ...opts, max_new_tokens: 220 });
