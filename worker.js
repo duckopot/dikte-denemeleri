@@ -1,22 +1,29 @@
-// Dikte worker – Whisper large-v3-turbo, on-device (transformers.js 3.8.1 + onnxruntime-web).
+// Dikte worker – Whisper on-device (transformers.js 3.8.1 + onnxruntime-web).
 // Memory strategy (see README): model files are downloaded in 8 MB Range chunks straight into Cache Storage
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
 import { pipeline, env } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m3';
+const BUILD = '2026-10-28-m4';
 const Q = new URL(self.location.href).searchParams;
-const MODEL = 'onnx-community/whisper-large-v3-turbo';
-const BASE = `https://huggingface.co/${MODEL}/resolve/main/`;
 const CHUNK = 8 * 1048576;
 const CHUNK_CACHE = 'model-chunks-v1', SMALL_CACHE = 'model-small-v1', LEGACY_CACHE = 'transformers-cache';
 // exact byte sizes from the Hugging Face tree API (onnx/ folder)
-const SIZES = {
+const MODELS = {
+  turbo: { id: 'onnx-community/whisper-large-v3-turbo', sizes: {
   'onnx/encoder_model_q4f16.onnx': 369974078, 'onnx/decoder_model_merged_q4f16.onnx': 193505017,
   'onnx/encoder_model_q4.onnx': 424942775,    'onnx/decoder_model_merged_q4.onnx': 334147222,
   'onnx/encoder_model_bnb4.onnx': 385622743,  'onnx/decoder_model_merged_bnb4.onnx': 327594234,
   'onnx/encoder_model_int8.onnx': 644822094,  'onnx/decoder_model_merged_int8.onnx': 439936716,
   'onnx/encoder_model_fp16.onnx': 1274342603, 'onnx/decoder_model_merged_fp16.onnx': 344227339,
+} },
+  small: { id: 'onnx-community/whisper-small', sizes: {
+    'onnx/encoder_model_q4.onnx': 66182104, 'onnx/decoder_model_merged_int8.onnx': 156750845,
+    'onnx/encoder_model_int8.onnx': 92326127, 'onnx/decoder_model_merged_q4.onnx': 233149327,
+  } },
 };
+let KEY = 'turbo', MODEL = MODELS.turbo.id, BASE = '', SIZES = {};
+function setModel(k) { KEY = MODELS[k] ? k : 'turbo'; MODEL = MODELS[KEY].id; BASE = `https://huggingface.co/${MODEL}/resolve/main/`; SIZES = MODELS[KEY].sizes; }
+setModel(Q.get('model') || 'turbo');
 const SMALL_MB = 4;   // tokenizer.json etc. (~4 MB, fetched by transformers.js itself)
 
 env.allowLocalModels = false;
@@ -167,6 +174,12 @@ async function gpuInfo() {
   } catch (e) { return null; }
 }
 async function pickConfig(force) {
+  if (KEY === 'small') {                                  // iPhone-friendly model: CPU/WASM (small weights, low memory)
+    const cfg = { device: 'wasm', enc: Q.get('enc') || 'q4', dec: Q.get('dec') || 'int8', label: 'Small · WASM' };
+    cfg.files = [`onnx/encoder_model_${cfg.enc}.onnx`, `onnx/decoder_model_merged_${cfg.dec}.onnx`];
+    cfg.bytes = cfg.files.reduce((x, f) => x + (SIZES[f] || 0), 0); cfg.mb = Math.round(cfg.bytes / 1e6); cfg.gpu = null;
+    return cfg;
+  }
   const g = force === 'wasm' ? null : await gpuInfo();
   let cfg;
   if (g && g.f16)  cfg = { device: 'webgpu', enc: 'q4f16', dec: 'q4f16', label: 'WebGPU · q4f16' };
@@ -206,7 +219,7 @@ function setThreads(cfg) {
 let asr = null, info = null;
 async function load(force) {
   if (asr) { post({ type: 'ready', ...info }); return; }
-  trace('başlıyor', { build: BUILD, ios: iOS });
+  trace('başlıyor', { build: BUILD, ios: iOS, model: KEY });
   let cfg = await pickConfig(force || Q.get('device'));
   T = { device: cfg.device + (cfg.decdev ? '+' + cfg.decdev : ''), dtype: cfg.enc + '/' + cfg.dec };
   trace('yapılandırma', { gpu: cfg.gpu, mb: cfg.mb, opt: Q.get('opt') || 'disabled' });
@@ -266,6 +279,7 @@ async function transcribe(m) {
 self.onmessage = (e) => {
   const m = e.data;
   const fail = (err, id) => { const t = String((err && err.message) || err); trace('hata', { err: t }); post({ type: 'error', text: t, id }); };
+  if (m.model) setModel(m.model);
   if (m.type === 'load') load(m.force).catch((err) => fail(err));
   else if (m.type === 'transcribe') chain = chain.then(() => transcribe(m)).catch((err) => fail(err, m.id));
   else if (m.type === 'probe') (async () => {       // is the model already fully stored? (for auto-load)
@@ -279,5 +293,13 @@ self.onmessage = (e) => {
       post({ type: 'cached', ok, have, all, label: cfg.label, mb: cfg.mb });
     } catch (err) { post({ type: 'cached', ok: false, have: 0, all: 0 }); }
   })();
-  else if (m.type === 'wipe') (async () => { for (const k of [CHUNK_CACHE, SMALL_CACHE, LEGACY_CACHE]) await caches.delete(k); post({ type: 'wiped' }); })();
+  else if (m.type === 'wipe') (async () => {       // m.all: every model; otherwise only the selected one
+    if (m.all) { for (const k of [CHUNK_CACHE, SMALL_CACHE, LEGACY_CACHE]) await caches.delete(k); }
+    else for (const k of [CHUNK_CACHE, SMALL_CACHE, LEGACY_CACHE]) {
+      if (!(await caches.has(k))) continue;
+      const c = await caches.open(k);
+      for (const r of await c.keys()) if (r.url.startsWith(BASE)) await c.delete(r);
+    }
+    post({ type: 'wiped', all: !!m.all });
+  })();
 };

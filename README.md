@@ -1,4 +1,7 @@
-# Dikte – tarayıcıda Whisper large-v3-turbo
+# Dikte – tarayıcıda Whisper (model seçimli)
+
+**Model seçimi (m4):** açılışta liste: `iPhone için (küçük)` = onnx-community/whisper-small (encoder q4 66 MB + decoder int8 157 MB = 223 MB, WASM) ve `Turbo (büyük, bilgisayar için)` = whisper-large-v3-turbo (aşağıda). iOS'ta küçük, diğerlerinde turbo önerilir; seçim `localStorage['dikte.model']`'de tutulur, `?model=small|turbo` ile zorlanır. Her modelin önbelleği ayrı (anahtarlar model deposunun URL'si), "Seçili modeli sil" / "Hepsini sil" bağlantıları var.
+
 
 Statik sayfa. Sunucu, analitik, CDN yok (çalışma anında). Ses cihazdan çıkmaz.
 - `@huggingface/transformers` 3.8.1 → `vendor/transformers.min.js` + ONNX Runtime wasm (yerel).

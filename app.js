@@ -31,8 +31,8 @@ worker.onmessage = (e) => {
     $('progText').textContent = pct.toFixed(0) + '% · ' + (m.loaded / 1048576).toFixed(0) + ' / ' + (m.total / 1048576).toFixed(0) + ' MB';
   } else if (m.type === 'status') $('status').textContent = m.text;
   else if (m.type === 'ready') {
-    ready = true; $('progWrap').hidden = true; loadBtn.hidden = true;
-    $('modelInfo').textContent = 'Model hazır (' + m.label + '). Artık çevrimdışı çalışır.';
+    ready = true; sel.disabled = false; $('progWrap').hidden = true; loadBtn.hidden = true;
+    $('modelInfo').textContent = MODEL_UI[chosen].name + ' hazır (' + m.label + '). Artık çevrimdışı çalışır.';
     $('status').textContent = '';
     mic.disabled = false; fileIn.disabled = false; $('micHint').textContent = 'Konuşmak için dokun';
     window.__ready = m;
@@ -41,7 +41,7 @@ worker.onmessage = (e) => {
     (waiters.get(m.id) || (() => {}))(m); window.__last = m;
   } else if (m.type === 'error') {
     pending = Math.max(0, pending - 1);
-    $('status').textContent = 'Hata: ' + m.text; loadBtn.disabled = false;
+    $('status').textContent = 'Hata: ' + m.text; loadBtn.disabled = false; sel.disabled = false;
     if (waiters.has(m.id)) waiters.get(m.id)({ error: m.text });
     window.__err = m.text;
   }
@@ -58,12 +58,32 @@ function send(audio) {
   return new Promise((res) => waiters.set(id, res));
 }
 
+// ---- Model picker (remembered in localStorage) ----
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const MODEL_UI = {
+  small: { name: 'iPhone için (küçük)', size: '~223 MB', desc: 'Whisper small, telefonda çalışır. Turbo kadar doğru değil.' },
+  turbo: { name: 'Turbo (büyük, bilgisayar için)', size: '564–759 MB', desc: 'Whisper large-v3-turbo, en iyi doğruluk. iPhone sekmesine sığmıyor.' },
+};
+const urlModel = new URLSearchParams(location.search).get('model');
+let chosen = MODEL_UI[urlModel] ? urlModel : (MODEL_UI[localStorage.getItem('dikte.model')] ? localStorage.getItem('dikte.model') : (IS_IOS ? 'small' : 'turbo'));
+const sel = $('model');
+for (const k of ['small', 'turbo']) { const o = document.createElement('option'); o.value = k; o.textContent = MODEL_UI[k].name + ' · ' + MODEL_UI[k].size + (k === (IS_IOS ? 'small' : 'turbo') ? ' · önerilen' : ''); sel.appendChild(o); }
+sel.value = chosen;
+let loadStarted = false;
+const showModel = () => { $('modelInfo').textContent = MODEL_UI[chosen].desc + ' Tamamen bu cihazda çalışır, ses hiçbir yere gönderilmez.'; loadBtn.textContent = 'Modeli indir ve yükle (' + MODEL_UI[chosen].size + ')'; };
+showModel();
+sel.onchange = () => {
+  chosen = sel.value; localStorage.setItem('dikte.model', chosen);
+  if (loadStarted || ready) { location.href = location.pathname + location.search.replace(/[?&]model=[^&]*/, '').replace(/^&/, '?'); return; }
+  showModel(); worker.postMessage({ type: 'probe', model: chosen, force: new URLSearchParams(location.search).get('device') });
+};
+
 loadBtn.onclick = () => {
-  loadBtn.disabled = true; $('status').textContent = 'Model indiriliyor…'; $('progWrap').hidden = false;
-  worker.postMessage({ type: 'load', force: new URLSearchParams(location.search).get('device') });
+  loadStarted = true; sel.disabled = true; loadBtn.disabled = true; $('status').textContent = 'Model indiriliyor…'; $('progWrap').hidden = false;
+  worker.postMessage({ type: 'load', model: chosen, force: new URLSearchParams(location.search).get('device') });
 };
 // ---- Crash-resilient diagnostics: the last stage is written to localStorage on every change ----
-const BUILD = '2026-10-28-m3';
+const BUILD = '2026-10-28-m4';
 const TRACE_KEY = 'dikte.trace';
 let lastTrace = null, lastWrite = 0;
 const readTrace = () => { try { return JSON.parse(localStorage.getItem(TRACE_KEY) || 'null'); } catch (e) { return null; } };
@@ -95,16 +115,18 @@ worker.addEventListener('message', (e) => {
     writeTrace({ ...rest, state: st, loaded: lastLoaded }, true);
   } else if (m.type === 'progress') { lastLoaded = m.loaded; if (lastTrace && lastTrace.state === 'running') writeTrace({ ...lastTrace, stage: lastTrace.stage, loaded: m.loaded, file: (m.file || '').replace('onnx/', '') }, false); }
   else if (m.type === 'error' && lastTrace && lastTrace.state !== 'error') writeTrace({ ...lastTrace, state: 'error', err: m.text }, true);
-  else if (m.type === 'wiped') { $('status').textContent = 'İndirilen model silindi.'; $('modelInfo').textContent = 'Model silindi. Yeniden indirmek için düğmeye bas.'; loadBtn.hidden = false; loadBtn.disabled = false; }
+  else if (m.type === 'wiped') { $('status').textContent = 'İndirilen model silindi. Sayfa yenileniyor…'; setTimeout(() => location.reload(), 800); }
   else if (m.type === 'cached') {
     if (m.ok && !crashed) loadBtn.click();                            // already stored and last run did not die: load by itself (works offline)
+    else if (!m.have) showModel();
     else if (m.have > 0 && !m.ok) loadBtn.textContent = 'İndirmeye devam et (' + Math.round(100 * m.have / m.all) + '% hazır)';
     else if (m.ok && crashed) loadBtn.textContent = 'Modeli belleğe yükle (indirilmiş)';
   }
 });
-worker.postMessage({ type: 'probe', force: new URLSearchParams(location.search).get('device') });
+worker.postMessage({ type: 'probe', model: chosen, force: new URLSearchParams(location.search).get('device') });
 if (new URLSearchParams(location.search).get('auto')) loadBtn.click();
-$('wipe').onclick = () => { if (confirm('İndirilen model silinsin mi?')) worker.postMessage({ type: 'wipe' }); };
+$('wipe').onclick = () => { if (confirm('Seçili model (' + MODEL_UI[chosen].name + ') silinsin mi?')) worker.postMessage({ type: 'wipe', model: chosen }); };
+$('wipeAll').onclick = () => { if (confirm('İndirilen tüm modeller silinsin mi?')) worker.postMessage({ type: 'wipe', model: chosen, all: true }); };
 $('envInfo').textContent += ' · sürüm ' + BUILD;
 
 // ---- Live dictation ----
