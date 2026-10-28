@@ -3,7 +3,7 @@
 // (never held whole in JS memory), then read back exactly once, one file at a time, into ONNX Runtime.
 import { pipeline, env } from './vendor/transformers.min.js';
 
-const BUILD = '2026-10-28-m2';
+const BUILD = '2026-10-28-m3';
 const Q = new URL(self.location.href).searchParams;
 const MODEL = 'onnx-community/whisper-large-v3-turbo';
 const BASE = `https://huggingface.co/${MODEL}/resolve/main/`;
@@ -175,6 +175,10 @@ async function pickConfig(force) {
   if (force === 'webgpu' && !g) throw new Error('Bu cihazda WebGPU yok.');
   if (Q.get('enc')) cfg.enc = Q.get('enc');
   if (Q.get('dec')) cfg.dec = Q.get('dec');
+  if (Q.get('decdev') && cfg.device === 'webgpu') {                   // split: encoder on GPU, decoder on CPU (WASM)
+    cfg.decdev = Q.get('decdev'); if (!Q.get('dec')) cfg.dec = 'q4';
+    cfg.label = 'WebGPU ' + cfg.enc + ' + WASM ' + cfg.dec;
+  }
   cfg.files = [`onnx/encoder_model_${cfg.enc}.onnx`, `onnx/decoder_model_merged_${cfg.dec}.onnx`];
   cfg.bytes = cfg.files.reduce((s, f) => s + (SIZES[f] || 0), 0);
   cfg.mb = Math.round(cfg.bytes / 1e6);
@@ -192,7 +196,7 @@ function sessionOptions(cfg) {
 function setThreads(cfg) {
   let n;
   if (Q.get('thr')) n = +Q.get('thr');
-  else if (cfg.device === 'webgpu') n = 1;                               // compute runs on the GPU
+  else if (cfg.device === 'webgpu' && !cfg.decdev) n = 1;                               // compute runs on the GPU
   else n = self.crossOriginIsolated ? Math.min(iOS ? 2 : 4, navigator.hardwareConcurrency || 2) : 1;
   env.backends.onnx.wasm.numThreads = n;
   return n;
@@ -204,7 +208,7 @@ async function load(force) {
   if (asr) { post({ type: 'ready', ...info }); return; }
   trace('başlıyor', { build: BUILD, ios: iOS });
   let cfg = await pickConfig(force || Q.get('device'));
-  T = { device: cfg.device, dtype: cfg.enc + '/' + cfg.dec };
+  T = { device: cfg.device + (cfg.decdev ? '+' + cfg.decdev : ''), dtype: cfg.enc + '/' + cfg.dec };
   trace('yapılandırma', { gpu: cfg.gpu, mb: cfg.mb, opt: Q.get('opt') || 'disabled' });
 
   // 1) download (streams to Cache Storage; low memory, resumable)
@@ -231,7 +235,7 @@ async function load(force) {
     else if (p.status === 'done' && /\.onnx$/.test(p.file)) { post({ type: 'status', text: 'Model oturumu kuruluyor: ' + short }); trace('oturum-kurma', { file: short }); }
   };
   const build = (c) => pipeline('automatic-speech-recognition', MODEL, {
-    device: c.device, dtype: { encoder_model: c.enc, decoder_model_merged: c.dec }, session_options: sessionOptions(c), progress_callback: cb,
+    device: c.decdev ? { encoder_model: c.device, decoder_model_merged: c.decdev } : c.device, dtype: { encoder_model: c.enc, decoder_model_merged: c.dec }, session_options: sessionOptions(c), progress_callback: cb,
   });
   try {
     asr = await build(cfg);
